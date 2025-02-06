@@ -1,0 +1,165 @@
+# Путь к папке для инсталляционных файлов
+$basePath = "C:\dist\GLPI"
+$allUsersDesktop = "$env:PUBLIC\Desktop"
+$installLog = "$basePath\install_log.txt"
+$agentFolder = "C:\Program Files\GLPI-Agent"
+$agentExecutable = "C:\Program Files\GLPI-Agent\perl\bin\glpi-agent.exe"
+$serverUrl = "http://10.1.0.14/glpi/"
+
+# Функция логирования
+function Write-Log {
+    $logMessage = "[{0}] {1}" -f (Get-Date -Format 'dd.MM.yyyy HH:mm:ss'), $args[0]
+    if (-not (Test-Path -Path $basePath)) {
+        New-Item -ItemType Directory -Path $basePath | Out-Null
+    }
+    $logMessage | Out-File -FilePath $installLog -Append -Encoding utf8
+    Write-Output $logMessage
+}
+
+# Проверка наличия установленного агента
+$installed = Test-Path $agentFolder
+$installedVersion = if ($installed) {
+    if (Test-Path $installLog) {
+        Get-Content $installLog | Select-String "Установленная версия:" | Select-Object -Last 1 | ForEach-Object {
+            $_ -replace ".*Установленная версия: ", ""
+        }
+    }
+} else {
+    ""
+}
+
+# Определение разрядности системы
+$arch = if ([Environment]::Is64BitOperatingSystem) { "x64" } else { "x86" }
+
+# Получение последнего релиза GLPI агента с GitHub
+try {
+    $releaseInfo = Invoke-RestMethod -Uri "https://api.github.com/repos/glpi-project/glpi-agent/releases/latest"
+    $asset = $releaseInfo.assets | Where-Object { $_.name -like "*$arch.msi" }
+    $latestVersion = $releaseInfo.tag_name.TrimStart('v')
+} catch {
+    Write-Log "Ошибка при обращении к GitHub API: $_"
+    return
+}
+
+# Проверка необходимости установки/обновления
+if (-not $installed) {
+    Write-Log "GLPI Agent не установлен. Установка будет выполнена."
+} elseif ($installedVersion -eq $latestVersion) {
+    Write-Log "GLPI Agent уже установлен и обновлен до последней версии $installedVersion."
+} else {
+    Write-Log "Доступна новая версия GLPI Agent: $latestVersion. Обновление будет выполнено."
+}
+
+if (-not $installed -or $installedVersion -ne $latestVersion) {
+    # Скачивание и установка/обновление GLPI Agent
+    $msiUrl = $asset.browser_download_url
+    $msiPath = Join-Path $basePath $asset.name
+
+    Write-Log "Скачивание GLPI Agent с $msiUrl"
+    try {
+        Invoke-WebRequest -Uri $msiUrl -OutFile $msiPath -ErrorAction Stop
+        Write-Log "Успешно загружен GLPI Agent"
+
+        Write-Log "Установка GLPI Agent"
+        try {
+            Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$msiPath`" /quiet /norestart" -Wait -NoNewWindow
+            Write-Log "GLPI Agent успешно установлен."
+            # Запись установленной версии в лог
+            Write-Log "Установленная версия: $latestVersion"
+        } catch {
+            Write-Log "Ошибка при установке GLPI Agent: $_"
+            return
+        }
+    } catch {
+        Write-Log "Ошибка при загрузке GLPI Agent: $_"
+        return
+    }
+    
+    # Обновляем запись сервера и перезапускаем агент сразу после установки
+    Write-Log "Принудительное обновление записи сервера в реестре..."
+    try {
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\GLPI-Agent" -Name "server" -Value $serverUrl -Force
+        Write-Log "Сервер $serverUrl успешно записан в реестр."
+
+        Write-Log "Перезапуск службы GLPI Agent..."
+        try {
+            Restart-Service -Name "glpi-agent" -Force
+            Write-Log "Служба GLPI Agent успешно перезапущена."
+        } catch {
+            Write-Log "Ошибка при перезапуске службы GLPI Agent: $_"
+        }
+    } catch {
+        Write-Log "Ошибка при записи сервера в реестр: $_"
+    }
+} else {
+    # Если агент уже установлен и обновлён, всё равно обновим сервер и перезапустим службу
+    Write-Log "Обновление записи сервера в реестре для уже установленного агента..."
+    try {
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\GLPI-Agent" -Name "server" -Value $serverUrl -Force
+        Write-Log "Сервер $serverUrl успешно записан в реестр."
+
+        Write-Log "Перезапуск службы GLPI Agent..."
+        try {
+            Restart-Service -Name "glpi-agent" -Force
+            Write-Log "Служба GLPI Agent успешно перезапущена."
+        } catch {
+            Write-Log "Ошибка при перезапуске службы GLPI Agent: $_"
+        }
+    } catch {
+        Write-Log "Ошибка при записи сервера в реестр: $_"
+    }
+}
+
+# Проверка и восстановление ярлыков на рабочем столе
+$iconUrl = "https://github.com/glpi-project/plugins/raw/master/frontend/app/favicon.ico"
+$iconPath = Join-Path $basePath "glpi-icon.ico"
+if (-not (Test-Path $iconPath)) {
+    Write-Log "Скачивание иконки"
+    try {
+        Invoke-WebRequest -Uri $iconUrl -OutFile $iconPath -ErrorAction Stop
+        Write-Log "Иконка успешно загружена."
+    } catch {
+        Write-Log "Ошибка при загрузке иконки: $_"
+    }
+}
+
+$shortcut1 = "$allUsersDesktop\GLPI - Создать заявку IT.lnk"
+$shortcut2 = "$allUsersDesktop\GLPI Руководство пользователя.lnk"
+
+$ws = New-Object -ComObject WScript.Shell
+
+# Восстановление ярлыков
+if (-not (Test-Path $shortcut1)) {
+    Write-Log "Создание ярлыка: GLPI - Создать заявку IT"
+    $sc1 = $ws.CreateShortcut($shortcut1)
+    $sc1.TargetPath = "http://10.1.0.14/glpi/front/ticket.form.php"
+    $sc1.IconLocation = $iconPath
+    $sc1.Save()
+} else {
+    Write-Log "Ярлык 'GLPI - Создать заявку IT' уже существует."
+}
+
+if (-not (Test-Path $shortcut2)) {
+    Write-Log "Создание ярлыка: GLPI Руководство пользователя"
+    $sc2 = $ws.CreateShortcut($shortcut2)
+    $sc2.TargetPath = "http://10.1.0.14/glpi/front/helpdesk.faq.php?id=14"
+    $sc2.IconLocation = $iconPath
+    $sc2.Save()
+} else {
+    Write-Log "Ярлык 'GLPI Руководство пользователя' уже существует."
+}
+
+# Удаление MSI файла
+if ($msiPath -and (Test-Path $msiPath)) {
+    Write-Log "Удаление MSI файла"
+    try {
+        Remove-Item $msiPath -Force
+        Write-Log "MSI файл удален."
+    } catch {
+        Write-Log "Ошибка при удалении MSI файла: $_"
+    }
+} else {
+    Write-Log "MSI файл не найден или путь не задан"
+}
+
+Write-Log "Установка завершена"
